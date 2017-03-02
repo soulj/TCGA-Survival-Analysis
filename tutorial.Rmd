@@ -1,0 +1,250 @@
+---
+title: "TCGA Survival Analysis"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+<h2>Intro</h2>
+
+Gene expression data allows us to gain a snapshot of the cellular state in diseased tissue and is increasingly been used in stratified/personalised medicine approaches.
+
+We'll be using RNA-sequencing data from cancer patients to demonstrate the principals of stratified medicine. The TGCA datasets provide a number of expression datasets with corresponding clinical data.
+
+In this tutorial we'll be using the R MarkDown notebooks to record our code and present the results. When you execute code within the notebook, the results appear beneath the code. Try executing the first chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*. When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+
+<h2>Analysis</h2>
+
+In this example we'll download expression data and clinical data for BRCA (breast invasive carcinoma).
+
+
+Load the expression data and have a look at it.
+```{r}
+#load the libraries
+library(survival)
+library(limma)
+library(DT)
+library(survminer)
+
+#read the expression data table - normalised RNA-seq counts for each gene+patient
+
+expressionDataPath<-"gdac.broadinstitute.org_BRCA.Merge_rnaseqv2__illuminahiseq_rnaseqv2__unc_edu__Level_3__RSEM_genes_normalized__data.Level_3.2016012800.0.0/BRCA.rnaseqv2__illuminahiseq_rnaseqv2__unc_edu__Level_3__RSEM_genes_normalized__data.data.txt"
+rna <- read.delim(expressionDataPath, header=T, sep="\t",row.names = 1)
+rna<-rna[-1,]
+x<-rna
+rna<- t(apply(rna,1,as.numeric))
+colnames(rna)<-colnames(x)
+
+#look at the structure of the table
+str(rna)
+
+#what are the dimensions of the table?
+dim(rna)
+
+#look at the first few rows and columns
+rna[1:3,1:3]
+
+
+```
+
+
+Remove the genes with more than 50% missing values
+```{r}
+
+#function to remove the samples with more than 50% missing values
+removeLowExpGenes<-function(rna){
+  numZeroCountSamples <- apply(rna,1,function(i) sum(i == 0))
+  toRemove <- which(numZeroCountSamples > ncol(rna)/2)
+  rna <- rna[-toRemove,]
+  return(rna)
+}
+
+rna.filt<-removeLowExpGenes(rna)
+
+#size of the filtered dataframe
+dim(rna.filt)
+```
+
+RNA-seq is not normally distributed so we need to variance stabilise the data. We can then calculate z-scores relative to the normal samples to give for each patient an indicator if a gene is under/over expressed
+```{r}
+
+#function to variance stabilise the data
+varianceStabilise<-function(expData,t_index){
+  
+  # define the linear model
+  cond <- factor(ifelse(seq(1, dim(expData)[2],1) %in% t_index, 1,  0))
+  d <- model.matrix(~1 + cond)
+  
+  #variance normalise the data
+  x <- t(apply(expData, 1, as.numeric))
+  expData_vm <- voom(x, d, plot=FALSE)$E
+  colnames(expData_vm) <- gsub("\\.","-",substr(colnames(expData),1,12))
+  return(expData_vm)
+}
+
+#function to z-score the data relative to the normal samples
+zScoreScale<-function(expData,n_index,t_index){
+  #control stats
+  mean_n <- rowMeans(expData[, n_index])
+  sd_n <- apply(expData[, n_index], 1, sd)
+  
+  #calculate the z-scores
+  tumor <- expData[,t_index]
+
+  z_expData<-t(sapply(1:nrow(tumor),function(x) (tumor[x,]-mean_n[x])/sd_n[x]))
+  rownames(z_expData) <- sapply(rownames(expData), function(x) unlist(strsplit(x,"\\|"))[[1]])
+
+    return(z_expData)
+}
+
+
+# get the indexes of the normal/control samples
+n_index <- which(substr(colnames(rna.filt),14,14) == "1")
+t_index <- which(substr(colnames(rna.filt),14,14) == "0")
+
+#variance stabilise the data
+rna.vst<-varianceStabilise(rna.filt,t_index)
+
+#z-score scale the data
+rna.zscore<-zScoreScale(rna.vst,n_index,t_index)
+
+```
+
+
+We wish to see if features in the gene expression data are useful in distinguishing between patient survival time. We have a missing data problem where patient death is not observed, but the date of the last followup is known. This means we can't use this patient after this follow-up date in the calculation since we don't known if the patient has died (right censored).
+
+
+```{r}
+#load the clinical data
+clincialDataPath<-"gdac.broadinstitute.org_BRCA.Clinical_Pick_Tier1.Level_4.2016012800.0.0/BRCA.clin.merged.picked.txt"
+clinicalData <- read.delim(clincialDataPath,sep="\t",stringsAsFactors = F)
+rownames(clinicalData)<-clinicalData[,1]
+clinicalData<-clinicalData[,-1]
+clinicalData<-as.data.frame(t(clinicalData))
+
+#what does it look like
+head(clinicalData)
+
+
+```
+
+We need to combine the days_to_death and days_to_last_followup columns to censor by the vital_status column
+```{r}
+#function to process the clinical data
+
+processClinical<-function(all_clin){
+  
+  # create vector time to death containing the values for days_to_death or days_to_last_followup to censor
+  all_clin$new_death <- c()
+  for (i in 1:length(as.numeric(as.character(all_clin$days_to_death)))){
+    all_clin$new_death[i] <- ifelse(is.na(as.numeric(as.character(all_clin$days_to_death))[i]),
+                                    as.numeric(as.character(all_clin$days_to_last_followup))[i],as.numeric(as.character(all_clin$days_to_death))[i])
+  }
+  
+  #get the IDs to match the expData IDs
+  IDS<-gsub(pattern = ".",replacement = "-",x = rownames(all_clin),fixed = T)
+  IDS<-toupper(IDS)
+  rownames(all_clin)<-IDS
+  
+  return(all_clin)
+  
+}
+
+clinicalData<-processClinical(clinicalData)
+
+# death censor variable
+clinicalData$death_event <- ifelse(clinicalData$vital_status == "alive", 0, 1)
+```
+
+match up the expression and the clinical data for statistical analysis
+```{r}
+# create event vector for RNASeq data
+# where signficantly differentially enriched gene > 1.96 zscore
+event_rna <- t(apply(rna.zscore, 1, function(x) ifelse(abs(x) >= 1.96,1,0)))
+
+# indices for matched samples
+ind_tum <- which(unique(colnames(rna.zscore)) %in% rownames(clinicalData))
+ind_clin <- which(rownames(clinicalData) %in% colnames(rna.zscore))
+
+#reorder the data to match
+clinicalData<-clinicalData[ind_clin ,]
+event_rna<- event_rna[, ind_tum]
+```
+
+
+Now we have the clinical data and the gene expression data set up, we can ask what features of the expression data effect the survival of the patients. 
+Let's choose a gene to stratify on, MYC for instance. Is the survival of the patients with differentially expressed MYC worse than those with normal levels?
+
+
+```{r}
+# gene of interest (p53). The $ means end of the line.
+ind_gene <- grep("TP53$",rownames(rna.zscore))
+variable<- event_rna[ind_gene,]
+
+# survival analysis
+s <- survfit(Surv(as.numeric(as.character(clinicalData$new_death)),
+                    clinicalData$death_event) ~ variable)
+#plot
+ggsurvplot(s,pval = T,pval.coord = c(5000,0.5),surv.median.line = "hv",risk.table = TRUE)
+```
+
+We can perform unsupervised clustering on the gene expression data to find groups of patients that differ in expression and use the survival data to validate the clusters.
+
+There are a plethora of clustering algorithms implemented in R including k-means,PCA,NMF
+
+```{r}
+
+#filter the variance stabilised data by the the most variable genes
+rna.vst.tumor<-rna.vst[,t_index]
+vars<-apply(rna.vst.tumor,1,var)
+topVarGenes<-sort(vars,decreasing = T)[1:1000]
+
+set.seed(42)
+#perform k-means clustering to group the patient gene expression into two groups
+clusters.kmeans<-kmeans(t(rna.vst.tumor[names(topVarGenes),]),centers = 2)$cluster
+
+#use PCA visualise the high dimentsion data (many genes) and seperate the samples by factors of variance
+
+#could use PCA as a clustering algorithm by defining clusters based on the principal component values.
+pca<-prcomp(t(rna.vst.tumor[names(topVarGenes),]))
+
+#plot the first and second principal components
+plot(pca$x[,1],pca$x[,2],col=c("red","blue")[clusters.kmeans])
+
+
+```
+
+Plot the survival curves for the two clusters - do the two subgroups have different survival?
+```{r}
+#order to match the clinical data
+variable<- clusters.kmeans[ind_tum]
+
+# survival analysis
+s <- survfit(Surv(as.numeric(as.character(clinicalData$new_death)),
+                    clinicalData$death_event) ~ variable)
+#plot
+ggsurvplot(s,pval = T,pval.coord = c(5000,0.5),surv.median.line = "hv",risk.table = TRUE)
+
+
+```
+
+Unsupervised clustering allows us to find subgroups on the basis of gene expression only that we can validate using the survival data. An alternative approach would be to perform supervised clustering where we use the survival data to find subgroups in the gene expression data.
+
+
+<h2>For you to try</h2>
+Explore the following questions. Make a record of your code and results in the R notebook.  
+
+Download another dataset from TCGA: http://firebrowse.org/  
+Choose a cancer and download from the graph on the right:  
+
+Clinical_Pick_Tier1 from Clinical  
+illuminahiseq_rnaseqv2-RSEM_genes_normalized from mRNASeq 
+
+
+
+* Rerun the code with the new data  
+* Choose different genes - can you find any discriminating genes? What genes are mentioned in the literature for the chosen cancer?  
+* Are there any published gene signatures for the chosen cancer? Modify the code to take several discriminant genes and rerun.
+* Modify the code to keep just the up-regulation of the chosen gene as the variable and rerun.  
+* What genes are important is distinguishing between the two subgroups? Do they make sense it terms of cancer biology?
